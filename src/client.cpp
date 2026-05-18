@@ -13,9 +13,9 @@
 
 namespace fs = std::filesystem;
 
-const int MASTER_PORT = 8080;
+const int MASTER_PORT         = 8080;
 const std::string MASTER_HOST = "127.0.0.1";
-const int REPLICATION_FACTOR = 2;
+const int REPLICATION_FACTOR  = 2;
 
 void sendMsg(int sock, const std::string& msg) {
     send(sock, msg.c_str(), msg.size(), 0);
@@ -31,15 +31,17 @@ std::string recvLine(int sock) {
     return result;
 }
 
+// Returns -1 on failure so callers can try a different server
+// rather than throwing an exception and giving up entirely.
 int connectTo(const std::string& host, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
+    addr.sin_port   = htons(port);
     inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
     if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
         close(sock);
-        return -1;  // return -1 on failure instead of throwing
+        return -1;
     }
     return sock;
 }
@@ -49,7 +51,9 @@ std::pair<std::string, int> parseAddress(const std::string& addr) {
     return { addr.substr(0, colon), std::stoi(addr.substr(colon + 1)) };
 }
 
-// Send one chunk to one chunk server. Returns true on success.
+// Attempts to store one chunk on one server.
+// Returns true on success, false if the server is unreachable
+// or responds with an error — the caller can then try another server.
 bool sendChunkToServer(const std::string& serverAddr,
                        const std::string& chunk_id,
                        const std::vector<char>& data) {
@@ -67,51 +71,60 @@ bool sendChunkToServer(const std::string& serverAddr,
     return response == "OK";
 }
 
+// -------------------------------------------------------
+// Store: splits the file locally, then sends each chunk
+// to REPLICATION_FACTOR servers and reports locations to Master.
+// -------------------------------------------------------
 void storeFile(const std::string& filepath) {
     std::string filename = fs::path(filepath).filename().string();
 
+    // Phase 1 logic: split the file into chunks locally first
     fs::create_directories("temp_chunks");
     FileMetadata meta = splitFile(filepath, "temp_chunks");
     std::cout << "\nFile split into " << meta.total_chunks << " chunks.\n";
 
-    // Ask Master for available chunk servers
+    // Ask the Master which chunk servers are currently available
     int masterSock = connectTo(MASTER_HOST, MASTER_PORT);
+    if (masterSock < 0) {
+        std::cerr << "Cannot connect to Master!\n";
+        return;
+    }
     sendMsg(masterSock, "STORE " + filename + " " +
             std::to_string(meta.total_size) + "\n");
 
     std::vector<std::string> servers;
     std::string line;
     while ((line = recvLine(masterSock)) != "END") {
-        if (line.substr(0, 3) == "CS ")
+        if (line.size() > 3 && line.substr(0, 3) == "CS ")
             servers.push_back(line.substr(3));
     }
     close(masterSock);
 
-    if (servers.size() < 2) {
-        std::cerr << "Need at least 2 chunk servers for replication. Found: "
-                  << servers.size() << "\n";
+    if ((int)servers.size() < REPLICATION_FACTOR) {
+        std::cerr << "Need at least " << REPLICATION_FACTOR
+                  << " chunk servers. Available: " << servers.size() << "\n";
         return;
     }
-    std::cout << "Chunk servers available: " << servers.size()
+    std::cout << "Servers available: " << servers.size()
               << " | Replication factor: " << REPLICATION_FACTOR << "\n\n";
 
     for (auto& chunkInfo : meta.chunks) {
-        // Load chunk data from local temp storage
+        // Read this chunk's bytes from local temp storage
         std::string chunkPath = "temp_chunks/" + chunkInfo.chunk_id;
         std::ifstream chunkFile(chunkPath, std::ios::binary);
         std::vector<char> data(chunkInfo.size);
         chunkFile.read(data.data(), chunkInfo.size);
         chunkFile.close();
 
-        // Pick REPLICATION_FACTOR servers for this chunk using round-robin.
-        // For chunk index i with N servers: use server[i%N] and server[(i+1)%N]
-        // This guarantees load is balanced — no single server gets all primary chunks.
+        // Pick REPLICATION_FACTOR servers using round-robin offset per chunk.
+        // Chunk 0 → servers[0], servers[1]
+        // Chunk 1 → servers[1], servers[2]  (rotated by 1)
+        // This balances primary and replica load across all servers.
         std::vector<std::string> replicas;
-        for (int r = 0; r < REPLICATION_FACTOR; r++) {
+        for (int r = 0; r < REPLICATION_FACTOR; r++)
             replicas.push_back(servers[(chunkInfo.index + r) % servers.size()]);
-        }
 
-        // Send chunk to ALL replica servers
+        // Send the chunk to each replica server
         std::vector<std::string> successfulReplicas;
         for (auto& srv : replicas) {
             std::cout << "  Sending chunk " << chunkInfo.index
@@ -130,17 +143,16 @@ void storeFile(const std::string& filepath) {
             continue;
         }
 
-        // Report ALL successful replica locations to Master
+        // Report all successful replica locations to the Master
         // Format: CHUNK_DONE chunk_id <num_replicas> server1 server2 index size
         int reportSock = connectTo(MASTER_HOST, MASTER_PORT);
         std::string report = "CHUNK_DONE " + chunkInfo.chunk_id + " " +
                              std::to_string(successfulReplicas.size());
-        for (auto& srv : successfulReplicas)
-            report += " " + srv;
+        for (auto& srv : successfulReplicas) report += " " + srv;
         report += " " + std::to_string(chunkInfo.index) +
                   " " + std::to_string(chunkInfo.size) + "\n";
         sendMsg(reportSock, report);
-        recvLine(reportSock);
+        recvLine(reportSock);  // wait for "OK"
         close(reportSock);
     }
 
@@ -148,36 +160,43 @@ void storeFile(const std::string& filepath) {
     std::cout << "\nStore complete: " << filename << "\n";
 }
 
+// -------------------------------------------------------
+// Fetch: gets chunk locations from Master, downloads each
+// chunk with automatic replica fallback, then reassembles.
+// -------------------------------------------------------
 void fetchFile(const std::string& filename) {
     int masterSock = connectTo(MASTER_HOST, MASTER_PORT);
+    if (masterSock < 0) {
+        std::cerr << "Cannot connect to Master!\n";
+        return;
+    }
     sendMsg(masterSock, "FETCH " + filename + "\n");
 
     std::string firstLine = recvLine(masterSock);
-    if (firstLine.substr(0, 2) != "OK") {
+    if (firstLine.size() < 2 || firstLine.substr(0, 2) != "OK") {
         std::cerr << "Master error: " << firstLine << "\n";
         close(masterSock);
         return;
     }
 
-    int totalChunks = std::stoi(firstLine.substr(3));
-
+    // Each chunk can have multiple replica servers listed.
+    // We try them in order until one succeeds — this is the
+    // fault tolerance payoff from writing to multiple servers.
     struct ChunkLocation {
         std::string chunk_id;
         size_t size;
         int index;
-        std::vector<std::string> servers;  // all replicas
+        std::vector<std::string> servers;
     };
 
     std::vector<ChunkLocation> chunks;
     std::string line;
     while ((line = recvLine(masterSock)) != "END") {
-        // Format: chunk_id size index server1 server2 ...
         std::istringstream iss(line);
         ChunkLocation loc;
         iss >> loc.chunk_id >> loc.size >> loc.index;
         std::string srv;
-        while (iss >> srv)
-            loc.servers.push_back(srv);
+        while (iss >> srv) loc.servers.push_back(srv);
         chunks.push_back(loc);
     }
     close(masterSock);
@@ -192,22 +211,23 @@ void fetchFile(const std::string& filename) {
     for (auto& loc : chunks) {
         bool fetched = false;
 
-        // Try each replica in order — this is the fault tolerance in action.
-        // If server 1 is dead, we automatically fall back to server 2.
+        // Try each replica in turn — if a server is unreachable,
+        // we automatically fall back to the next one without any
+        // user-visible error, which is the whole point of replication.
         for (auto& serverAddr : loc.servers) {
             auto [host, port] = parseAddress(serverAddr);
             int csSock = connectTo(host, port);
 
             if (csSock < 0) {
-                std::cout << "  [WARN] Chunk " << loc.index
-                          << ": " << serverAddr << " unreachable, trying next replica...\n";
-                continue;  // try next replica
+                std::cout << "  [WARN] Chunk " << loc.index << ": "
+                          << serverAddr << " unreachable, trying next replica...\n";
+                continue;
             }
 
             sendMsg(csSock, "GET " + loc.chunk_id + "\n");
             std::string response = recvLine(csSock);
 
-            if (response.substr(0, 5) != "SIZE ") {
+            if (response.size() < 5 || response.substr(0, 5) != "SIZE ") {
                 std::cout << "  [WARN] Bad response from " << serverAddr
                           << ", trying next replica...\n";
                 close(csSock);
@@ -218,7 +238,8 @@ void fetchFile(const std::string& filename) {
             std::vector<char> data(size);
             size_t received = 0;
             while (received < size) {
-                ssize_t n = recv(csSock, data.data() + received, size - received, 0);
+                ssize_t n = recv(csSock, data.data() + received,
+                                 size - received, 0);
                 if (n <= 0) break;
                 received += n;
             }
@@ -229,18 +250,18 @@ void fetchFile(const std::string& filename) {
             out.close();
 
             std::cout << "  Fetched chunk " << loc.index
-                      << " ← " << serverAddr << " ✓\n";
+                      << " <- " << serverAddr << "\n";
             fetched = true;
             break;  // success — no need to try other replicas
         }
 
         if (!fetched) {
-            std::cerr << "CRITICAL: Could not fetch chunk " << loc.index
+            std::cerr << "CRITICAL: Cannot fetch chunk " << loc.index
                       << " from any replica!\n";
         }
     }
 
-    // Reassemble
+    // Reassemble chunks into the final output file
     std::string outputPath = "restored_" + filename;
     std::ofstream outFile(outputPath, std::ios::binary);
     for (auto& loc : chunks) {
@@ -252,17 +273,21 @@ void fetchFile(const std::string& filename) {
     outFile.close();
 
     fs::remove_all("temp_chunks");
-    std::cout << "\nFile restored → " << outputPath << "\n";
+    std::cout << "\nFile restored -> " << outputPath << "\n";
 }
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cout << "Usage:\n  ./client store <filepath>\n  ./client fetch <filename>\n";
+        std::cout << "Usage:\n";
+        std::cout << "  ./client store <filepath>\n";
+        std::cout << "  ./client fetch <filename>\n";
         return 1;
     }
+
     std::string command = argv[1];
     if      (command == "store") storeFile(argv[2]);
     else if (command == "fetch") fetchFile(argv[2]);
-    else std::cout << "Unknown command.\n";
+    else std::cout << "Unknown command: " << command << "\n";
+
     return 0;
 }
