@@ -6,6 +6,9 @@
 #include <mutex>
 #include <algorithm>
 #include <filesystem>
+#include <unordered_map>
+#include <ctime>        // for time_t and std::time()
+#include <chrono>       // for sleep_for
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -14,13 +17,23 @@
 
 namespace fs = std::filesystem;
 
+// -------------------------------------------------------
+// Global state
+// -------------------------------------------------------
 MetadataStore metaStore;
-std::vector<std::string> chunkServers;
+std::vector<std::string> chunkServers;      // active, healthy servers
 std::mutex csMutex;
 int roundRobinIndex = 0;
 
+// Heartbeat tracking: maps "host:port" → timestamp of last heartbeat received.
+// time_t is just a long integer representing seconds since Unix epoch (Jan 1 1970).
+// std::time(nullptr) gives you the current timestamp.
+std::unordered_map<std::string, time_t> lastHeartbeat;
+std::mutex hbMutex;  // separate mutex for heartbeat map
+
 const int MASTER_PORT = 8080;
-const int REPLICATION_FACTOR = 2;  // every chunk goes to 2 servers
+const int REPLICATION_FACTOR = 2;
+const int HEARTBEAT_TIMEOUT = 9;  // seconds — 3 missed heartbeats
 
 void sendMsg(int sock, const std::string& msg) {
     send(sock, msg.c_str(), msg.size(), 0);
@@ -36,10 +49,6 @@ std::string recvLine(int sock) {
     return result;
 }
 
-// Returns REPLICATION_FACTOR servers for one chunk using round-robin.
-// For chunk 0 with 2 servers: picks server[0], server[1]
-// For chunk 1 with 2 servers: picks server[1], server[0]  ← rotated
-// This ensures load is evenly spread across all servers.
 std::vector<std::string> pickReplicaServers() {
     std::lock_guard<std::mutex> lock(csMutex);
     std::vector<std::string> selected;
@@ -47,11 +56,52 @@ std::vector<std::string> pickReplicaServers() {
     if (n == 0) return selected;
 
     int count = std::min(REPLICATION_FACTOR, n);
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < count; i++)
         selected.push_back(chunkServers[(roundRobinIndex + i) % n]);
-    }
     roundRobinIndex = (roundRobinIndex + 1) % n;
     return selected;
+}
+
+// -------------------------------------------------------
+// Monitor thread — runs continuously in the background.
+// Every second it wakes up, checks all known servers,
+// and removes any that haven't sent a heartbeat within
+// the HEARTBEAT_TIMEOUT window.
+// -------------------------------------------------------
+void monitorLoop() {
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        time_t now = std::time(nullptr);  // current timestamp in seconds
+
+        std::lock_guard<std::mutex> hbLock(hbMutex);
+        std::lock_guard<std::mutex> csLock(csMutex);
+
+        // Walk through every server we've ever heard from
+        for (auto it = lastHeartbeat.begin(); it != lastHeartbeat.end(); ++it) {
+            std::string server = it->first;
+            time_t lastSeen    = it->second;
+            double silence     = difftime(now, lastSeen);  // seconds since last heartbeat
+
+            // Is this server currently in our active list?
+            bool isActive = std::find(chunkServers.begin(),
+                                      chunkServers.end(), server) != chunkServers.end();
+
+            if (isActive && silence > HEARTBEAT_TIMEOUT) {
+                // Server has gone silent — declare it dead and remove from active pool.
+                // New chunks will no longer be assigned to this server.
+                std::cout << "\n[Master] ⚠ FAILURE DETECTED: " << server
+                          << " (silent for " << (int)silence << "s) — marking as DEAD\n\n";
+
+                chunkServers.erase(
+                    std::remove(chunkServers.begin(), chunkServers.end(), server),
+                    chunkServers.end()
+                );
+                // Note: we deliberately keep the server in lastHeartbeat map.
+                // If it comes back online and sends REGISTER again, we re-add it.
+            }
+        }
+    }
 }
 
 void handleClient(int clientSock) {
@@ -66,10 +116,45 @@ void handleClient(int clientSock) {
         std::string host, port;
         iss >> host >> port;
         std::string address = host + ":" + port;
-        std::lock_guard<std::mutex> lock(csMutex);
-        chunkServers.push_back(address);
-        std::cout << "[Master] Registered chunk server: " << address << "\n";
+
+        {
+            std::lock_guard<std::mutex> lock(csMutex);
+            // Avoid duplicate registration — if server was dead and comes back,
+            // it will send REGISTER again. Only add if not already present.
+            if (std::find(chunkServers.begin(), chunkServers.end(), address)
+                == chunkServers.end()) {
+                chunkServers.push_back(address);
+                std::cout << "[Master] Registered: " << address << "\n";
+            } else {
+                std::cout << "[Master] Re-registered (back online): " << address << "\n";
+            }
+        }
+
+        // Initialize heartbeat timestamp immediately on registration
+        {
+            std::lock_guard<std::mutex> lock(hbMutex);
+            lastHeartbeat[address] = std::time(nullptr);
+        }
+
         sendMsg(clientSock, "OK\n");
+    }
+
+    else if (command == "HEARTBEAT") {
+        // Chunk server is saying "I'm alive".
+        // We simply update its timestamp in the heartbeat map.
+        std::string host, port;
+        iss >> host >> port;
+        std::string address = host + ":" + port;
+
+        {
+            std::lock_guard<std::mutex> lock(hbMutex);
+            lastHeartbeat[address] = std::time(nullptr);
+        }
+
+        sendMsg(clientSock, "OK\n");
+        // Note: we do NOT print every heartbeat — it would flood the terminal.
+        // Uncomment the line below only when debugging:
+        // std::cout << "[Master] Heartbeat from " << address << "\n";
     }
 
     else if (command == "STORE") {
@@ -78,21 +163,21 @@ void handleClient(int clientSock) {
         iss >> filename >> filesize;
 
         FileMetadata meta;
-        meta.filename = filename;
-        meta.total_size = filesize;
+        meta.filename    = filename;
+        meta.total_size  = filesize;
         meta.total_chunks = 0;
         metaStore.addFile(filename, meta);
 
-        // Send all available chunk servers — client will pick replicas itself
-        std::lock_guard<std::mutex> lock(csMutex);
-        for (auto& cs : chunkServers)
-            sendMsg(clientSock, "CS " + cs + "\n");
+        {
+            std::lock_guard<std::mutex> lock(csMutex);
+            for (auto& cs : chunkServers)
+                sendMsg(clientSock, "CS " + cs + "\n");
+        }
         sendMsg(clientSock, "END\n");
     }
 
     else if (command == "CHUNK_DONE") {
-        // New format: CHUNK_DONE chunk_id <num_replicas> server1 server2 index size
-        // Example:    CHUNK_DONE file_chunk_0 2 localhost:9001 localhost:9002 0 1048576
+        // Format: CHUNK_DONE chunk_id <num_replicas> server1 server2 index size
         std::string chunk_id;
         int numReplicas;
         iss >> chunk_id >> numReplicas;
@@ -110,8 +195,8 @@ void handleClient(int clientSock) {
         metaStore.addChunk(filename, info);
         metaStore.saveToDisk("master_meta", filename);
 
-        std::cout << "[Master] Chunk stored: " << chunk_id
-                  << " on " << numReplicas << " server(s)\n";
+        std::cout << "[Master] Chunk recorded: " << chunk_id
+                  << " on " << numReplicas << " replica(s)\n";
         sendMsg(clientSock, "OK\n");
     }
 
@@ -134,7 +219,6 @@ void handleClient(int clientSock) {
         sendMsg(clientSock, "OK " + std::to_string(meta.total_chunks) + "\n");
 
         for (auto& c : meta.chunks) {
-            // Send: chunk_id size index server1 server2 ...
             std::string msg = c.chunk_id + " " + std::to_string(c.size) +
                               " " + std::to_string(c.index);
             for (auto& srv : c.server_addresses)
@@ -156,13 +240,19 @@ int main() {
     setsockopt(serverSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     sockaddr_in addr{};
-    addr.sin_family = AF_INET;
+    addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(MASTER_PORT);
+    addr.sin_port        = htons(MASTER_PORT);
 
     bind(serverSock, (sockaddr*)&addr, sizeof(addr));
     listen(serverSock, 10);
+
     std::cout << "[Master] Running on port " << MASTER_PORT << "\n";
+    std::cout << "[Master] Heartbeat timeout: " << HEARTBEAT_TIMEOUT << "s\n\n";
+
+    // Launch monitor thread — it runs forever in the background
+    // checking for dead servers independently of the request-handling loop
+    std::thread(monitorLoop).detach();
 
     while (true) {
         sockaddr_in clientAddr{};

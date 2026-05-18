@@ -4,6 +4,7 @@
 #include <sstream>
 #include <vector>
 #include <thread>
+#include <chrono>       // for std::this_thread::sleep_for
 #include <filesystem>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -12,11 +13,14 @@
 
 namespace fs = std::filesystem;
 
-std::string storageDir;  // where this server saves its chunks
+std::string storageDir;
+int myPort;
+std::string myHost = "localhost";
 
-// -------------------------------------------------------
-// Helpers (same as master)
-// -------------------------------------------------------
+const int MASTER_PORT = 8080;
+const std::string MASTER_HOST = "127.0.0.1";
+const int HEARTBEAT_INTERVAL = 3;  // send a heartbeat every 3 seconds
+
 void sendMsg(int sock, const std::string& msg) {
     send(sock, msg.c_str(), msg.size(), 0);
 }
@@ -31,20 +35,13 @@ std::string recvLine(int sock) {
     return result;
 }
 
-// -------------------------------------------------------
-// Handle one client (could be another chunk server or client)
-// -------------------------------------------------------
 void handleClient(int clientSock) {
     std::string line = recvLine(clientSock);
-    std::cout << "[ChunkServer] Received: " << line << "\n";
-
     std::istringstream iss(line);
     std::string command;
     iss >> command;
 
     if (command == "PUT") {
-        // Client stores a chunk: "PUT chunk_id size"
-        // Followed immediately by 'size' bytes of raw binary data
         std::string chunk_id;
         size_t size;
         iss >> chunk_id >> size;
@@ -57,11 +54,11 @@ void handleClient(int clientSock) {
             return;
         }
 
-        // Read exactly 'size' bytes from the socket
-        // We cannot just call recv once — TCP may deliver data in pieces
-        // so we loop until we have all bytes
+        // Read raw bytes in a loop — TCP does not guarantee all bytes
+        // arrive in a single recv() call, so we keep reading until
+        // we have received exactly 'size' bytes.
         size_t received = 0;
-        std::vector<char> buffer(4096);  // read in 4KB chunks
+        std::vector<char> buffer(4096);
         while (received < size) {
             size_t toRead = std::min(buffer.size(), size - received);
             ssize_t n = recv(clientSock, buffer.data(), toRead, 0);
@@ -71,12 +68,12 @@ void handleClient(int clientSock) {
         }
         out.close();
 
-        std::cout << "[ChunkServer] Stored: " << chunk_id << " (" << received << " bytes)\n";
+        std::cout << "[CS:" << myPort << "] Stored: " << chunk_id
+                  << " (" << received << " bytes)\n";
         sendMsg(clientSock, "OK\n");
     }
 
     else if (command == "GET") {
-        // Client requests a chunk: "GET chunk_id"
         std::string chunk_id;
         iss >> chunk_id;
 
@@ -88,15 +85,12 @@ void handleClient(int clientSock) {
             return;
         }
 
-        // Get file size
         in.seekg(0, std::ios::end);
         size_t fileSize = in.tellg();
         in.seekg(0, std::ios::beg);
 
-        // Send size first so client knows how many bytes to read
         sendMsg(clientSock, "SIZE " + std::to_string(fileSize) + "\n");
 
-        // Stream the chunk data directly from disk to socket
         std::vector<char> buffer(4096);
         while (!in.eof()) {
             in.read(buffer.data(), buffer.size());
@@ -106,36 +100,65 @@ void handleClient(int clientSock) {
         }
         in.close();
 
-        std::cout << "[ChunkServer] Sent: " << chunk_id << "\n";
+        std::cout << "[CS:" << myPort << "] Sent: " << chunk_id << "\n";
     }
 
     close(clientSock);
 }
 
-// -------------------------------------------------------
-// Register this chunk server with the Master Node
-// -------------------------------------------------------
-void registerWithMaster(const std::string& masterHost, int masterPort,
-                        const std::string& myHost, int myPort) {
+void registerWithMaster() {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(masterPort);
-    inet_pton(AF_INET, masterHost.c_str(), &addr.sin_addr);
+    addr.sin_port = htons(MASTER_PORT);
+    inet_pton(AF_INET, MASTER_HOST.c_str(), &addr.sin_addr);
 
     if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "[ChunkServer] Cannot connect to Master!\n";
+        std::cerr << "[CS:" << myPort << "] Cannot connect to Master!\n";
         return;
     }
 
     std::string msg = "REGISTER " + myHost + " " + std::to_string(myPort) + "\n";
     send(sock, msg.c_str(), msg.size(), 0);
 
-    // Read the "OK" response
     char buf[64] = {};
     recv(sock, buf, sizeof(buf), 0);
-    std::cout << "[ChunkServer] Registered with Master. Response: " << buf;
+    std::cout << "[CS:" << myPort << "] Registered with Master.\n";
     close(sock);
+}
+
+// This function runs in its own background thread.
+// It wakes up every HEARTBEAT_INTERVAL seconds, opens a fresh
+// TCP connection to the Master, sends "HEARTBEAT host port",
+// waits for "OK", and then closes the connection and sleeps again.
+// Using a fresh connection each time keeps the implementation simple
+// and avoids issues with long-lived idle connections being dropped
+// by firewalls or OS-level TCP keepalive timeouts.
+void heartbeatLoop() {
+    while (true) {
+        // Sleep first, then send — gives Master time to start up
+        std::this_thread::sleep_for(std::chrono::seconds(HEARTBEAT_INTERVAL));
+
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(MASTER_PORT);
+        inet_pton(AF_INET, MASTER_HOST.c_str(), &addr.sin_addr);
+
+        if (connect(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+            // Master might be temporarily unreachable — just warn and retry next cycle
+            std::cerr << "[CS:" << myPort << "] Heartbeat failed — cannot reach Master\n";
+            close(sock);
+            continue;
+        }
+
+        std::string msg = "HEARTBEAT " + myHost + " " + std::to_string(myPort) + "\n";
+        send(sock, msg.c_str(), msg.size(), 0);
+        recvLine(sock);  // wait for "OK"
+        close(sock);
+
+        std::cout << "[CS:" << myPort << "] Heartbeat sent ♥\n";
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -144,19 +167,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    int port = std::stoi(argv[1]);
-    storageDir = "chunks_" + std::to_string(port);
+    myPort = std::stoi(argv[1]);
+    storageDir = "chunks_" + std::to_string(myPort);
     fs::create_directories(storageDir);
 
-    // Each chunk server stores its chunks in its own folder
-    // chunks_9001/ for the server on port 9001
-    // chunks_9002/ for the server on port 9002
-    std::cout << "[ChunkServer] Storage: " << storageDir << "\n";
+    std::cout << "[CS:" << myPort << "] Storage: " << storageDir << "\n";
 
-    // Announce ourselves to the Master
-    registerWithMaster("127.0.0.1", 8080, "localhost", port);
+    registerWithMaster();
 
-    // Start TCP server
+    // Launch heartbeat in a background thread.
+    // std::thread::detach() means we don't need to join it later —
+    // it runs independently until the process exits.
+    std::thread(heartbeatLoop).detach();
+
+    // Main thread handles incoming chunk requests as before
     int serverSock = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(serverSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -164,12 +188,12 @@ int main(int argc, char* argv[]) {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
+    addr.sin_port = htons(myPort);
 
     bind(serverSock, (sockaddr*)&addr, sizeof(addr));
     listen(serverSock, 10);
 
-    std::cout << "[ChunkServer] Running on port " << port << "\n";
+    std::cout << "[CS:" << myPort << "] Running on port " << myPort << "\n";
 
     while (true) {
         sockaddr_in clientAddr{};
