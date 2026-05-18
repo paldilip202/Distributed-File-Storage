@@ -1,12 +1,17 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra
+CXXFLAGS = -std=c++17 -Wall -Wextra -pthread
 
-SRC = src/main.cpp src/chunker.cpp src/metadata.cpp
-OUT = dfs
+all: master chunkserver client
 
-all:
-	$(CXX) $(CXXFLAGS) $(SRC) -o $(OUT)
+master:
+	$(CXX) $(CXXFLAGS) src/master.cpp src/metadata.cpp -o master
+
+chunkserver:
+	$(CXX) $(CXXFLAGS) src/chunkserver.cpp src/chunker.cpp -o chunkserver
+
+client:
+	$(CXX) $(CXXFLAGS) src/client.cpp src/chunker.cpp src/metadata.cpp -o client
 
 clean:
-	rm -f $(OUT)
-	rm -rf chunks/
+	rm -f master chunkserver client
+	rm -rf chunks_* master_meta temp_chunks restored_*

@@ -1,0 +1,8 @@
+filename:testfile.bin
+total_size:5242880
+total_chunks:5
+chunk:testfile.bin_chunk_0:1048576:0:localhost:9001
+chunk:testfile.bin_chunk_1:1048576:1:localhost:9002
+chunk:testfile.bin_chunk_2:1048576:2:localhost:9001
+chunk:testfile.bin_chunk_3:1048576:3:localhost:9002
+chunk:testfile.bin_chunk_4:1048576:4:localhost:9001
