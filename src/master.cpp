@@ -4,34 +4,28 @@
 #include <sstream>
 #include <thread>
 #include <mutex>
-#include <algorithm>   
-#include <filesystem>       
+#include <algorithm>
+#include <filesystem>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include "metadata.h"
 
-// -------------------------------------------------------
-// Global state — shared across all client handler threads
-// -------------------------------------------------------
+namespace fs = std::filesystem;
+
 MetadataStore metaStore;
-std::vector<std::string> chunkServers;  // list of "host:port" strings
-std::mutex csMutex;  // protects chunkServers vector
-int roundRobinIndex = 0;  // for distributing chunks across servers evenly
+std::vector<std::string> chunkServers;
+std::mutex csMutex;
+int roundRobinIndex = 0;
 
 const int MASTER_PORT = 8080;
+const int REPLICATION_FACTOR = 2;  // every chunk goes to 2 servers
 
-// -------------------------------------------------------
-// Helper: send a complete string over a socket
-// -------------------------------------------------------
 void sendMsg(int sock, const std::string& msg) {
     send(sock, msg.c_str(), msg.size(), 0);
 }
 
-// -------------------------------------------------------
-// Helper: read one line (up to '\n') from a socket
-// -------------------------------------------------------
 std::string recvLine(int sock) {
     std::string result;
     char c;
@@ -42,22 +36,24 @@ std::string recvLine(int sock) {
     return result;
 }
 
-// -------------------------------------------------------
-// Pick the next chunk server using round-robin
-// Round-robin means we cycle through servers evenly:
-// chunk0 → server1, chunk1 → server2, chunk2 → server1...
-// -------------------------------------------------------
-std::string pickChunkServer() {
+// Returns REPLICATION_FACTOR servers for one chunk using round-robin.
+// For chunk 0 with 2 servers: picks server[0], server[1]
+// For chunk 1 with 2 servers: picks server[1], server[0]  ← rotated
+// This ensures load is evenly spread across all servers.
+std::vector<std::string> pickReplicaServers() {
     std::lock_guard<std::mutex> lock(csMutex);
-    if (chunkServers.empty()) return "";
-    std::string server = chunkServers[roundRobinIndex % chunkServers.size()];
-    roundRobinIndex++;
-    return server;
+    std::vector<std::string> selected;
+    int n = chunkServers.size();
+    if (n == 0) return selected;
+
+    int count = std::min(REPLICATION_FACTOR, n);
+    for (int i = 0; i < count; i++) {
+        selected.push_back(chunkServers[(roundRobinIndex + i) % n]);
+    }
+    roundRobinIndex = (roundRobinIndex + 1) % n;
+    return selected;
 }
 
-// -------------------------------------------------------
-// Handle one client connection in its own thread
-// -------------------------------------------------------
 void handleClient(int clientSock) {
     std::string line = recvLine(clientSock);
     std::cout << "[Master] Received: " << line << "\n";
@@ -67,64 +63,59 @@ void handleClient(int clientSock) {
     iss >> command;
 
     if (command == "REGISTER") {
-        // Chunk server announcing itself: "REGISTER localhost 9001"
         std::string host, port;
         iss >> host >> port;
         std::string address = host + ":" + port;
-
         std::lock_guard<std::mutex> lock(csMutex);
         chunkServers.push_back(address);
-        std::cout << "[Master] Chunk server registered: " << address << "\n";
+        std::cout << "[Master] Registered chunk server: " << address << "\n";
         sendMsg(clientSock, "OK\n");
     }
 
     else if (command == "STORE") {
-        // Client wants to store a file: "STORE movie.mp4 5242880"
         std::string filename;
         size_t filesize;
         iss >> filename >> filesize;
 
-        // Initialize empty metadata entry for this file
         FileMetadata meta;
         meta.filename = filename;
         meta.total_size = filesize;
         meta.total_chunks = 0;
         metaStore.addFile(filename, meta);
 
-        // Tell client which chunk servers are available
+        // Send all available chunk servers — client will pick replicas itself
         std::lock_guard<std::mutex> lock(csMutex);
-        for (auto& cs : chunkServers) {
+        for (auto& cs : chunkServers)
             sendMsg(clientSock, "CS " + cs + "\n");
-        }
         sendMsg(clientSock, "END\n");
     }
 
     else if (command == "CHUNK_DONE") {
-        // Client reports a chunk was stored: "CHUNK_DONE chunk_id host:port index size"
-        std::string chunk_id, server;
-        int index;
-        size_t size;
-        iss >> chunk_id >> server >> index >> size;
+        // New format: CHUNK_DONE chunk_id <num_replicas> server1 server2 index size
+        // Example:    CHUNK_DONE file_chunk_0 2 localhost:9001 localhost:9002 0 1048576
+        std::string chunk_id;
+        int numReplicas;
+        iss >> chunk_id >> numReplicas;
 
         ChunkInfo info;
         info.chunk_id = chunk_id;
-        info.server_address = server;
-        info.index = index;
-        info.size = size;
+        for (int i = 0; i < numReplicas; i++) {
+            std::string srv;
+            iss >> srv;
+            info.server_addresses.push_back(srv);
+        }
+        iss >> info.index >> info.size;
 
-        // Parse filename from chunk_id (everything before "_chunk_")
         std::string filename = chunk_id.substr(0, chunk_id.rfind("_chunk_"));
-
         metaStore.addChunk(filename, info);
-
-        // Save to disk after every chunk (crash safety)
         metaStore.saveToDisk("master_meta", filename);
 
+        std::cout << "[Master] Chunk stored: " << chunk_id
+                  << " on " << numReplicas << " server(s)\n";
         sendMsg(clientSock, "OK\n");
     }
 
     else if (command == "FETCH") {
-        // Client wants to fetch a file: "FETCH movie.mp4"
         std::string filename;
         iss >> filename;
 
@@ -135,8 +126,6 @@ void handleClient(int clientSock) {
         }
 
         FileMetadata meta = metaStore.getFile(filename);
-
-        // Sort chunks by index to ensure correct order
         std::sort(meta.chunks.begin(), meta.chunks.end(),
                   [](const ChunkInfo& a, const ChunkInfo& b) {
                       return a.index < b.index;
@@ -144,11 +133,14 @@ void handleClient(int clientSock) {
 
         sendMsg(clientSock, "OK " + std::to_string(meta.total_chunks) + "\n");
 
-        // Send one line per chunk: "chunk_id host:port size index"
         for (auto& c : meta.chunks) {
-            sendMsg(clientSock, c.chunk_id + " " + c.server_address +
-                    " " + std::to_string(c.size) +
-                    " " + std::to_string(c.index) + "\n");
+            // Send: chunk_id size index server1 server2 ...
+            std::string msg = c.chunk_id + " " + std::to_string(c.size) +
+                              " " + std::to_string(c.index);
+            for (auto& srv : c.server_addresses)
+                msg += " " + srv;
+            msg += "\n";
+            sendMsg(clientSock, msg);
         }
         sendMsg(clientSock, "END\n");
     }
@@ -156,45 +148,27 @@ void handleClient(int clientSock) {
     close(clientSock);
 }
 
-// -------------------------------------------------------
-// Main: start TCP server and accept connections
-// -------------------------------------------------------
 int main() {
-    // Load any previously saved metadata from disk on startup
-    std::filesystem::create_directories("master_meta");
+    fs::create_directories("master_meta");
 
     int serverSock = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSock < 0) {
-        std::cerr << "Socket creation failed\n";
-        return 1;
-    }
-
-    // Allow reusing the port immediately after restart
     int opt = 1;
     setsockopt(serverSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;  // accept connections on any network interface
-    addr.sin_port = htons(MASTER_PORT); // htons converts port to network byte order
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(MASTER_PORT);
 
-    if (bind(serverSock, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "Bind failed on port " << MASTER_PORT << "\n";
-        return 1;
-    }
-
-    listen(serverSock, 10);  // queue up to 10 pending connections
+    bind(serverSock, (sockaddr*)&addr, sizeof(addr));
+    listen(serverSock, 10);
     std::cout << "[Master] Running on port " << MASTER_PORT << "\n";
 
-    // Accept loop — runs forever, handles each connection in a new thread
     while (true) {
         sockaddr_in clientAddr{};
-        socklen_t clientLen = sizeof(clientAddr);
-        int clientSock = accept(serverSock, (sockaddr*)&clientAddr, &clientLen);
-
+        socklen_t len = sizeof(clientAddr);
+        int clientSock = accept(serverSock, (sockaddr*)&clientAddr, &len);
         if (clientSock < 0) continue;
-
-        // Detach thread: it runs independently and cleans itself up
         std::thread(handleClient, clientSock).detach();
     }
 
